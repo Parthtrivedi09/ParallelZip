@@ -1,0 +1,11 @@
+build/
+*.exe
+*.o
+*.obj
+
+.vscode/
+
+*.pzip
+
+temp/
+output/
