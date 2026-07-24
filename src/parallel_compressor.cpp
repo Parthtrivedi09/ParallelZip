@@ -2,8 +2,22 @@
 
 #include <algorithm>
 #include <stdexcept>
-#include <thread>
 #include <vector>
+#include "checksum.h"
+#include "thread_pool.h"
+
+
+namespace {
+
+// Each compression task processes approximately 4 MB.
+//
+// Chunk count and thread count are intentionally independent:
+// a file may contain hundreds of chunks while only eight
+// worker threads process them.
+constexpr std::size_t CHUNK_SIZE =
+    4 * 1024 * 1024;
+
+}
 
 
 ParallelCompressedData parallelCompress(
@@ -11,6 +25,12 @@ ParallelCompressedData parallelCompress(
     std::size_t threadCount
 ) {
     ParallelCompressedData result;
+    // Calculate the checksum of the COMPLETE original file
+    // before splitting it into chunks.
+    //
+    // This value will later be stored in the .pzip archive
+    // and used to verify the decompressed file.
+    result.checksum = calculateCRC32(data);
 
     if (data.empty()) {
         return result;
@@ -22,93 +42,58 @@ ParallelCompressedData parallelCompress(
         );
     }
 
-    // Creating more chunks than bytes would be pointless.
-    //
-    // Example:
-    // 3-byte file + 8 requested threads
-    // -> use at most 3 chunks.
+    // Calculate how many fixed-size chunks are required.
     std::size_t chunkCount =
-        std::min(threadCount, data.size());
+        (data.size() + CHUNK_SIZE - 1) /
+        CHUNK_SIZE;
 
     result.chunks.resize(chunkCount);
     result.originalChunkSizes.resize(chunkCount);
 
-    std::vector<std::thread> workers;
+    // Never create more worker threads than useful tasks.
+    std::size_t workerCount =
+        std::min(threadCount, chunkCount);
 
-    workers.reserve(chunkCount);
+    ThreadPool pool(workerCount);
 
-    // Divide the file as evenly as possible.
-    //
-    // Example:
-    // 10 bytes / 3 chunks
-    //
-    // baseChunkSize = 3
-    // remainder     = 1
-    //
-    // sizes become:
-    // 4, 3, 3
-    std::size_t baseChunkSize =
-        data.size() / chunkCount;
-
-    std::size_t remainder =
-        data.size() % chunkCount;
-
-    std::size_t start = 0;
 
     for (std::size_t i = 0; i < chunkCount; i++) {
 
-        // Distribute leftover bytes among the first chunks.
-        std::size_t currentChunkSize =
-            baseChunkSize + (i < remainder ? 1 : 0);
+        std::size_t start =
+            i * CHUNK_SIZE;
 
         std::size_t end =
-            start + currentChunkSize;
+            std::min(
+                start + CHUNK_SIZE,
+                data.size()
+            );
 
         result.originalChunkSizes[i] =
-            currentChunkSize;
+            end - start;
 
-        // Each worker gets its own copy of its chunk.
-        //
-        // This keeps workers independent and avoids multiple
-        // threads reading/modifying shared chunk state.
-        std::vector<unsigned char> chunk(
-            data.begin() + start,
-            data.begin() + end
-        );
+        pool.enqueue(
+            [&, i, start, end]() {
 
-        workers.emplace_back(
-            [chunk = std::move(chunk), &result, i]() {
+                // Each worker creates a private chunk from
+                // its assigned section of the input.
+                std::vector<unsigned char> chunk(
+                    data.begin() + start,
+                    data.begin() + end
+                );
 
-                // Each thread independently:
-                //
-                // chunk
-                //   ↓
-                // frequency table
-                //   ↓
-                // Huffman tree
-                //   ↓
-                // bit-packed compressed data
+                // Each result index belongs to exactly one task,
+                // so workers do not overwrite one another.
                 result.chunks[i] =
                     huffmanCompress(chunk);
             }
         );
-
-        start = end;
     }
 
-    // join() blocks until each worker has completed.
-    //
-    // We MUST wait before using result.chunks because the
-    // worker threads are still writing their results.
-    for (std::thread& worker : workers) {
-
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
+    pool.wait();
 
     return result;
 }
+
 
 std::vector<unsigned char> parallelDecompress(
     const ParallelCompressedData& compressed,
@@ -127,57 +112,55 @@ std::vector<unsigned char> parallelDecompress(
     std::size_t chunkCount =
         compressed.chunks.size();
 
-    // One output vector for each compressed chunk.
     std::vector<std::vector<unsigned char>>
         decompressedChunks(chunkCount);
 
-    std::vector<std::thread> workers;
+    std::size_t workerCount =
+        std::min(threadCount, chunkCount);
 
-    workers.reserve(chunkCount);
+    ThreadPool pool(workerCount);
 
-    // For this first version, each compressed chunk gets
-    // its own worker. The archive's chunk count was created
-    // from the requested compression thread count.
-    //
-    // Later a fixed worker pool can schedule arbitrary
-    // numbers of chunks onto fewer threads.
+
     for (std::size_t i = 0; i < chunkCount; i++) {
 
-        workers.emplace_back(
-            [&compressed, &decompressedChunks, i]() {
+        pool.enqueue(
+            [&, i]() {
 
                 decompressedChunks[i] =
                     huffmanDecompress(
                         compressed.chunks[i]
                     );
+
+                // Validate against the original size recorded
+                // in the archive metadata.
+                if (decompressedChunks[i].size() !=
+                    compressed.originalChunkSizes[i]) {
+
+                    throw std::runtime_error(
+                        "Decompressed chunk size mismatch."
+                    );
+                }
             }
         );
     }
 
-    for (std::thread& worker : workers) {
+    pool.wait();
 
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
 
-    // Merge chunks AFTER all threads finish.
-    //
-    // Ordering matters:
-    //
-    // chunk 0 + chunk 1 + chunk 2 ...
-    //
-    // reconstructs the original file.
-    std::vector<unsigned char> output;
-
+    // Determine the final file size before merging so the
+    // output vector only needs one allocation.
     std::size_t totalSize = 0;
 
     for (const auto& chunk : decompressedChunks) {
         totalSize += chunk.size();
     }
 
+    std::vector<unsigned char> output;
+
     output.reserve(totalSize);
 
+
+    // Chunks must be concatenated in their original order.
     for (const auto& chunk : decompressedChunks) {
 
         output.insert(
@@ -189,5 +172,3 @@ std::vector<unsigned char> parallelDecompress(
 
     return output;
 }
-
-

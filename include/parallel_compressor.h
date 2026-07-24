@@ -2,33 +2,48 @@
 #define PARALLEL_COMPRESSOR_H
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "huffman.h"
 
-// Contains all independently compressed chunks.
+
+// Represents the complete result of parallel compression.
 struct ParallelCompressedData {
+
+    // Each element contains one independently
+    // Huffman-compressed chunk.
     std::vector<HuffmanEncodedData> chunks;
 
-    // Original number of bytes in each chunk.
-    // This is useful for validation and reconstruction.
+    // Stores the original size of every chunk.
+    // This helps us validate decompression later.
     std::vector<std::size_t> originalChunkSizes;
+
+    // CRC32 checksum of the COMPLETE original file.
+    //
+    // We calculate this before compression and store it
+    // inside the .pzip archive.
+    //
+    // After decompression we calculate CRC32 again.
+    // If both checksums match, the reconstructed file
+    // passed our integrity check.
+    std::uint32_t checksum = 0;
 };
 
-// Compress input using multiple worker threads.
+
+// Compress a file using multiple worker threads.
 ParallelCompressedData parallelCompress(
     const std::vector<unsigned char>& data,
     std::size_t threadCount
 );
 
-// Decompress all chunks concurrently and reconstruct
-// the original byte sequence in the correct order.
+
+// Decompress chunks using multiple worker threads
+// and reconstruct the original file.
 std::vector<unsigned char> parallelDecompress(
     const ParallelCompressedData& compressed,
     std::size_t threadCount
 );
 
 
-
 #endif
-

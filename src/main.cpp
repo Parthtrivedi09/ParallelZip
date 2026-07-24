@@ -7,7 +7,7 @@
 #include "archive.h"
 #include "file_utils.h"
 #include "parallel_compressor.h"
-
+#include "checksum.h"
 
 int main(int argc, char* argv[]) {
 
@@ -222,7 +222,23 @@ int main(int argc, char* argv[]) {
                     threadCount
                 );
 
+            // Calculate CRC32 again after decompression.
+            //
+            // If this checksum differs from the value stored in the
+            // archive, the archive or reconstructed data is corrupted.
+            std::uint32_t reconstructedChecksum =
+                calculateCRC32(reconstructed);
 
+            if (reconstructedChecksum != compressed.checksum) {
+
+                throw std::runtime_error(
+                    "Checksum verification failed. "
+                    "Archive may be corrupted."
+                );
+            }
+
+            std::cout
+                << "Integrity check: PASSED\n";
             auto end =
                 std::chrono::steady_clock::now();
 
